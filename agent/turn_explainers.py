@@ -67,6 +67,29 @@ def _file_mutation_identity(path: str, task_id: Optional[str]) -> str:
         resolved = str(_resolve_path_for_task(path, task_id or "default"))
     except Exception:
         resolved = os.path.abspath(os.path.expanduser(path))
+    # A bare skill spelling (``<skill-name>/SKILL.md``) misses under the task cwd but
+    # lives in a profile skills root — a failed attempt under that spelling and the
+    # skill-managed write that later lands at the real path must meet on one identity,
+    # or a successful patch keeps a stale FAILED footer. Fires only when
+    # the primary target does not exist and the first path segment is an actual skill
+    # directory in one of the skills roots.
+    if not os.path.exists(resolved) and not os.path.isabs(path):
+        try:
+            from agent.skill_utils import get_all_skills_dirs
+
+            tail = os.path.normpath(path)
+            first = tail.split(os.sep)[0]
+            for root in get_all_skills_dirs():
+                if not (root / first).is_dir():
+                    continue
+                cand = root / tail
+                if cand.is_file():
+                    resolved = str(cand)
+                    break
+        except (ImportError, OSError, RuntimeError, ValueError):
+            # Skills-root discovery reads config and the filesystem: a broken skills
+            # configuration must not cost the identity of a plain file mutation.
+            pass
     return os.path.normcase(os.path.normpath(resolved))
 
 
