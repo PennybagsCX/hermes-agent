@@ -166,6 +166,11 @@ class GatewayAgentCacheMixin:
         from hermes_cli.runtime_provider import is_foreign_provider_endpoint
         if is_foreign_provider_endpoint(provider, override.get("base_url")):
             override["base_url"] = None  # left over from a switch that kept the previous provider's URL
+        from hermes_cli.runtime_provider import heal_stale_vendor_pinned_base_url
+        # A pin of the provider's own vendor host at an endpoint config no longer declares is a
+        # relic from before the route moved (e.g. a proxy/gate configured later): adopt the
+        # configured endpoint instead of bypassing it forever.
+        override["base_url"] = heal_stale_vendor_pinned_base_url(provider, override.get("base_url")) or None
         if provider:
             # Re-resolve credentials for the persisted provider. On failure (e.g. credentials removed
             # since the switch) keep the credential-less override — _resolve_session_agent_runtime

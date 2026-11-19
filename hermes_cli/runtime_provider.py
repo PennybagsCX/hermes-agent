@@ -392,6 +392,55 @@ def is_foreign_provider_endpoint(provider: Optional[str], base_url: Optional[str
     return any(url == (other.inference_base_url or "").rstrip("/") for other in PROVIDER_REGISTRY.values())
 
 
+def heal_stale_vendor_pinned_base_url(
+    provider: Optional[str], persisted_base_url: Optional[str],
+    *, model_cfg: Optional[dict[str, Any]] = None,
+) -> str:
+    """Endpoint a persisted session route should use: config wins over a stale same-vendor pin.
+
+    A session that ran a built-in provider DIRECT before a proxy/gate was configured keeps the
+    vendor URL in its persisted runtime route; resume used to re-apply it verbatim, so the session
+    bypassed the new endpoint forever. When the persisted URL sits on the provider's canonical
+    vendor host but config now declares a different endpoint for that provider
+    (``model.providers.<p>.base_url``, or ``model.base_url`` on a ``model.provider`` match), the
+    configured endpoint wins. Deliberate pins on other hosts (enterprise proxies, regional
+    gateways) are never rewritten; with no configured endpoint there is nothing to heal to and the
+    pin is kept.
+    """
+    persisted_raw = str(persisted_base_url or "").strip()
+    persisted = persisted_raw.rstrip("/")
+    if not persisted:
+        return persisted_raw
+    provider_norm = str(provider or "").strip().lower()
+    pconfig = PROVIDER_REGISTRY.get(provider_norm)
+    if pconfig is None or not str(pconfig.inference_base_url or "").strip():
+        return persisted_raw
+    cfg = model_cfg if model_cfg is not None else _get_model_config()
+    configured = ""
+    providers_table = cfg.get("providers") if isinstance(cfg, dict) else None
+    if isinstance(providers_table, dict):
+        entry = providers_table.get(provider_norm)
+        if isinstance(entry, dict):
+            configured = str(entry.get("base_url") or "").strip().rstrip("/")
+    if not configured:
+        configured = _config_base_url_for_provider(cfg, provider_norm)
+    configured = str(configured or "").strip().rstrip("/")
+    if not configured or configured == persisted:
+        return persisted_raw
+    pin_host = (base_url_hostname(persisted) or "").lower()
+    canonical_host = (base_url_hostname(str(pconfig.inference_base_url)) or "").lower()
+    # Relic signature only: vendor-host pin -> NON-vendor configured endpoint (a direct pin
+    # predating a serializing gate/proxy). Same-vendor-host differences are platform-selected
+    # surfaces (api.z.ai /api/paas/v4 vs /api/coding/paas/v4 bill separately) and loopback
+    # servers (lmstudio ports) are deliberate — never healed across them.
+    if not pin_host or pin_host != canonical_host:
+        return persisted_raw
+    configured_host = (base_url_hostname(configured) or "").lower()
+    if not configured_host or configured_host == canonical_host:
+        return persisted_raw
+    return configured
+
+
 def _anthropic_base_url_override_ok(base_url: str) -> bool:
     """Whether a configured ``model.base_url`` plausibly speaks the Anthropic Messages protocol:
     official Anthropic/Claude hosts, Azure Foundry, or ``/anthropic`` / Kimi ``/coding`` proxies

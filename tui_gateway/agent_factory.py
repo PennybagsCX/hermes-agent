@@ -151,6 +151,10 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     if is_foreign_provider_endpoint(provider, base_url):
         # The endpoint and its wire belong to the provider this chat left; resolve the stored one's own.
         base_url = api_mode = ""
+    from hermes_cli.runtime_provider import heal_stale_vendor_pinned_base_url
+    # Same-vendor relic pins heal to the configured endpoint; deliberate proxy pins on other
+    # hosts are kept.
+    base_url = heal_stale_vendor_pinned_base_url(provider, base_url) or ""
     # Heal a stale provider persisted by an older build (renamed/removed custom provider → "Unknown provider"):
     # recover ``custom:<name>`` from the stored base_url, then from the entry serving the model; else drop it.
     if provider and not _is_routable_provider(provider):
