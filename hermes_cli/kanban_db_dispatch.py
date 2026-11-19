@@ -1,3 +1,6 @@
+# health: allow FILE_LINES -- the terminal-worker reaper must use this module's private process-identity helpers
+# (_worker_alive/_pid_alive/_append_event) and its signal path; splitting the 3.0k-line dispatcher into a package is a
+# separate refactor, not something to bundle into a reaper bug fix.
 """Dispatcher: crash/stale/orphan detection, failure accounting and the respawn circuit breaker, memory-aware concurrency caps, the one-shot ``dispatch_once`` pass, worker spawning (``_default_spawn``), worker-log rotation and the long-lived ``run_daemon`` loop.
 
 Split out of ``hermes_cli.kanban_db``; origin-resident helpers are reached
@@ -11,6 +14,7 @@ import contextlib
 import os
 import re
 import signal
+import json
 import sqlite3
 import subprocess
 import sys
@@ -376,6 +380,45 @@ def _process_fingerprint(pid: int) -> Optional[str]:
     return f"{current_instantiation_epoch()}|{start}"
 
 
+def _bound_worker_target(conn, row, pid: int, fingerprint) -> tuple[int, object]:
+    """The pid to reap, and its fingerprint.
+
+    ``task_runs.worker_pid`` is written at spawn and holds the LAUNCHER. The real worker
+    process binds afterwards and records itself in a ``worker_bound`` event. Signalling the
+    launcher alone leaves the bound worker running: it keeps the board open, then the reaper
+    fires a false ``terminal_worker_breach``. Prefer the bound pid when it is still the same
+    spawn (identical fingerprint); otherwise fall back to the recorded worker (a run whose
+    launcher was already dead while the bound worker stayed alive past the reap window).
+    """
+    try:
+        bound = conn.execute(
+            "SELECT payload FROM task_events WHERE run_id = ? AND kind = 'worker_bound' "
+            "ORDER BY id DESC LIMIT 1",
+            (row["id"],),
+        ).fetchone()
+    except sqlite3.Error:
+        return pid, fingerprint
+    if not bound:
+        return pid, fingerprint
+    try:
+        data = json.loads(bound["payload"] or "{}")
+        bound_pid = int(data.get("pid") or 0)
+    except (ValueError, TypeError):
+        return pid, fingerprint
+    if bound_pid <= 0 or bound_pid == pid:
+        return pid, fingerprint
+    # Identity = the BOUND process's own start fingerprint (the worker_bound event
+    # records it). Pairing the bound pid with the LAUNCHER's fingerprint makes
+    # _worker_alive/_terminate read the live worker as "recycled": the reaper would
+    # skip signalling it and clear the row's evidence — the orphan survives silently.
+    # A bind event WITHOUT its own started_at must therefore never inherit the
+    # launcher fingerprint either: probe the live process instead; an empty probe
+    # leaves the pid unsignalled (identity unproven) rather than paired with a
+    # foreign fingerprint.
+    bound_fp = str(data.get("started_at") or "").strip() or (_process_fingerprint(bound_pid) or "")
+    return bound_pid, bound_fp
+
+
 def _worker_alive(pid: Optional[int], started_at) -> bool:
     """True when ``pid`` is live AND is still the worker we spawned. ``started_at`` is the fingerprint
     recorded by ``_set_worker_pid``; after a reboot (or any PID recycle) an unrelated process can own
@@ -457,6 +500,12 @@ def _terminate_reclaimed_worker(
         "termination_attempted": False,
         "terminated": False,
         "sigkill": False,
+        # ``signal_delivered`` distinguishes a SIGTERM/SIGKILL that
+        # actually reached a live process from a no-op on a pid that was already
+        # gone (or from a recycled-pid/UNVERIFIED skip, which signal nobody).
+        # Breach decisions may only cite a DELIVERED signal as evidence.
+        "signal_delivered": False,
+        "already_gone": False,
     }
     if not pid or pid <= 0 or not claim_lock:
         return info
@@ -480,6 +529,18 @@ def _terminate_reclaimed_worker(
     info["termination_attempted"] = True
     try:
         kill(int(pid), signal.SIGTERM)
+        # Only a SIGTERM that reached a live process counts as
+        # breach evidence; a no-op on a dead pid sets already_gone instead.
+        info["signal_delivered"] = True
+    except ProcessLookupError:
+        # Already gone = successful termination. Leaving terminated=False would
+        # make the reclaim guard misread a dead worker as alive and defer forever.
+        # ``already_gone`` + signal_delivered=False keep that honest for breach
+        # decisions: a no-op kill on a dead pid is NOT evidence that a live
+        # worker was terminated.
+        info["already_gone"] = True
+        info["terminated"] = True
+        return info
     except OSError:
         # Already gone = successful termination (Windows reports an absent pid as a bare OSError, not
         # ProcessLookupError). Leaving terminated=False would make the reclaim defer forever.
@@ -493,6 +554,7 @@ def _terminate_reclaimed_worker(
         if not _sigkill(kill, pid):
             return info
         info["sigkill"] = True
+        info["signal_delivered"] = True
     info["terminated"] = not _worker_alive(pid, started_at)
     return info
 
@@ -509,7 +571,7 @@ def reap_terminal_workers(conn: sqlite3.Connection, *, signal_fn=None) -> list[s
     One row's failure (signal, /proc probe) is logged and skips only that row.
     Returns the task ids whose worker was terminated."""
     rows = conn.execute(
-        "SELECT id, task_id, worker_pid, worker_started_at, claim_lock FROM task_runs "
+        "SELECT id, task_id, worker_pid, worker_started_at, claim_lock, ended_at FROM task_runs "
         "WHERE ended_at IS NOT NULL AND ended_at <= ? "
         "AND worker_pid IS NOT NULL AND worker_started_at IS NOT NULL",
         (int(time.time()) - TERMINAL_WORKER_REAP_GRACE_SECONDS,),
@@ -533,26 +595,128 @@ def _reap_terminal_worker_row(conn, row, host_prefix: str, signal_fn, reaped: li
         return
     if fingerprint == UNVERIFIED_WORKER_FINGERPRINT and _kb._pid_alive(pid):
         return  # unproven identity: never signalled; its evidence is cleared once the pid is gone
-    alive = _worker_alive(pid, fingerprint)
-    termination = None
-    if alive:
+    if _worker_still_finishing(conn, row):
+        # TERMINAL-WORKER-FINISHING-GUARD: the board call closed this run but the worker is still writing its
+        # final session state and owes a worker_result event. Reaping it here fires a
+        # FALSE terminal_worker_breach (the run was closed before the worker finished
+        # writing, and the reaper killed it mid-write).
+        return
+    recorded_alive = _worker_alive(pid, fingerprint)
+    # REAP-THE-BOUND-PID: worker_pid is the LAUNCHER. The real worker
+    # binds later and records its own pid in a worker_bound event. Killing only the launcher left
+    # the bound worker alive holding the board for 3+ minutes: false breach plus an orphan.
+    # Target selection is LIVENESS-keyed per pid: each pid is signalled only when
+    # its OWN probe says it is alive. The earlier ``bound-alive OR launcher-alive`` OR-fold let
+    # a live launcher drive a SIGTERM at a dead bound pid, and ProcessLookupError then reported
+    # ``terminated`` — a no-op kill posing as a termination.
+    target, target_fp = _bound_worker_target(conn, row, pid, fingerprint)
+    bound_alive = target != pid and _worker_alive(target, target_fp)
+    kills: list[dict[str, Any]] = []
+    if bound_alive:
+        termination = _terminate_reclaimed_worker(
+            target, row["claim_lock"], signal_fn=signal_fn, started_at=target_fp)
+        if not termination["terminated"]:
+            # LAYER 4: unkillable worker on a terminal run — kernel
+            # log only (an event here would fire every tick); the breach event
+            # below lands once, when the termination finally succeeds.
+            _kb._log.warning(
+                "kanban breach: worker %s on TERMINAL run %s (task %s) is alive "
+                "past the %ss grace and survived re-termination",
+                target, row["id"], row["task_id"], TERMINAL_WORKER_REAP_GRACE_SECONDS,
+            )
+            return  # still alive: try again next tick
+        kills.append(termination)
+    if recorded_alive:
         termination = _terminate_reclaimed_worker(
             pid, row["claim_lock"], signal_fn=signal_fn, started_at=fingerprint)
         if not termination["terminated"]:
+            _kb._log.warning(
+                "kanban breach: worker %s on TERMINAL run %s (task %s) is alive "
+                "past the %ss grace and survived re-termination",
+                pid, row["id"], row["task_id"], TERMINAL_WORKER_REAP_GRACE_SECONDS,
+            )
             return  # still alive: try again next tick
+        kills.append(termination)
     with _kb.write_txn(conn):
         conn.execute(
             "UPDATE task_runs SET worker_pid = NULL, worker_started_at = NULL "
             "WHERE id = ? AND worker_pid = ? AND worker_started_at = ?",
             (row["id"], pid, fingerprint),
         )
-        if alive:
+        if kills:
+            payload: dict[str, Any] = {
+                "pid": pid, "worker_started_at": fingerprint,
+                "reap_target_pid": kills[0]["prev_pid"],
+                "reap_target_started_at": target_fp if bound_alive else fingerprint,
+                "kills": kills,
+            }
+            payload.update(kills[0])
             _kb._append_event(
-                conn, row["task_id"], "terminal_worker_reaped",
-                {"pid": pid, "worker_started_at": fingerprint, **termination}, run_id=row["id"],
+                conn, row["task_id"], "terminal_worker_reaped", payload,
+                run_id=row["id"],
             )
-    if alive:
+            # BREACH GATE: the breach pages the operator, so it may only
+            # cite evidence that the worker we actually signalled was terminated —
+            # a DELIVERED signal to a probe-confirmed-alive process. A no-op kill on
+            # a dead pid (ProcessLookupError) proves nothing. And reaping the BOUND
+            # worker is the reaper finishing what the completion transition could not
+            # see — routine cleanup, not a design gap; only a signalled RECORDED
+            # worker_pid outliving its run pages.
+            breach = any(
+                k["prev_pid"] == pid and k.get("signal_delivered") and k["terminated"]
+                for k in kills
+            )
+            if breach:
+                _kb._append_event(
+                    conn, row["task_id"], "terminal_worker_breach",
+                    {"pid": pid, "worker_started_at": fingerprint, "run_id": row["id"],
+                     "run_ended_at": row["ended_at"], "terminated": True,
+                     "reap_target_pid": kills[0]["prev_pid"],
+                     "reap_target_started_at": target_fp if bound_alive else fingerprint,
+                     "grace_seconds": TERMINAL_WORKER_REAP_GRACE_SECONDS},
+                    run_id=row["id"],
+                )
+    if kills:
         reaped.append(row["task_id"])
+
+
+def _worker_still_finishing(conn, row) -> bool:
+    """True while this run's worker plausibly still owes its final result.
+
+    TERMINAL-WORKER-FINISHING-GUARD: the board call closed this run
+    but the worker may still be writing its final session state; reaping mid-write
+    fired a FALSE terminal_worker_breach (the run was closed before the worker
+    finished writing, and the reaper killed it mid-write).
+
+    The wait is bounded by post-close LIVENESS, not by the event itself: a closed
+    run with no ``worker_result`` event AND no heartbeat after ``ended_at`` has
+    nobody finishing — the result is never coming. The plain event-wait predicate
+    this replaces deferred such runs forever: an idle bound worker survived holding
+    the board and broke the reaper's
+    original contract (#111791): a worker that completed and then hung is exactly
+    what this sweep exists to end.
+    """
+    try:
+        done = conn.execute(
+            "SELECT 1 FROM task_events WHERE run_id = ? AND kind = 'worker_result' LIMIT 1",
+            (row["id"],),
+        ).fetchone()
+        if done is not None:
+            return False
+        hb = conn.execute(
+            "SELECT MAX(created_at) AS last_beat FROM task_events "
+            "WHERE run_id = ? AND kind = 'heartbeat'",
+            (row["id"],),
+        ).fetchone()
+    except sqlite3.Error:
+        return False
+    last_beat = hb["last_beat"] if hb else None
+    if last_beat is None:
+        return False
+    try:
+        return int(last_beat) > int(row["ended_at"])
+    except (TypeError, ValueError):
+        return False
 
 
 def _worker_survived_termination(termination: dict) -> bool:
@@ -1596,6 +1760,7 @@ def check_respawn_guard(
         "ORDER BY ended_at DESC LIMIT 1",
         (task_id,),
     ).fetchone()
+
     if latest_run is not None and latest_run["outcome"] == "spawn_failed":
         if rl_cooldown > 0 and _kb._json_dict(latest_run["metadata"]).get("infrastructure"):
             ended_at = _kb._to_epoch(latest_run["ended_at"])
