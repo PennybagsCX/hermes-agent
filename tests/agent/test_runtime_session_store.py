@@ -153,3 +153,75 @@ def test_worker_store_persists_and_restores_the_tools_prefix_pin(tmp_path):
             store._outbox_owner.close()
     finally:
         db.close()
+
+
+def test_a_usage_receipt_an_older_owner_cannot_parse_costs_one_receipt_not_the_turn(tmp_path):
+    """An update staged on disk while the gateway kept its previous release in memory: workers run
+    the newer build and send `usage.main` with a field the older owner does not know. The owner's
+    closed allowlist answers `invalid_params`; left fatal, the sticky failure would take the
+    assistant turn, the lease release and the whole conversation with it. A metric the owner
+    cannot parse must cost that metric, and the payload the owner refused must never be the one
+    journaled for replay."""
+    store = None
+    attempts, journaled_at_retry = [], []
+    journal_path = tmp_path / 'private' / 'pending.json'
+
+    def older_owner(method, **params):
+        operation = params['operation']
+        attempts.append((operation, 'prompt_cache_clock' in params['payload']))
+        if operation == 'usage.main' and 'prompt_cache_clock' in params['payload']:
+            raise WorkerPersistenceError('invalid_params')      # the older owner's usage allowlist
+        if len(attempts) == 2:                                  # the degraded resubmission
+            pending = json.loads(journal_path.read_text())['pending']
+            journaled_at_retry.append(pending[0]['payload'])
+        if operation == 'transcript.append':
+            return {'count': len(params['payload']['messages']),
+                    'annotations': [{} for _ in params['payload']['messages']]}
+        return {'value': None}
+
+    store = RuntimeSessionStore(older_owner, {'session_id': 's'}, tmp_path / 'private')
+    try:
+        store.queue_token_counts('s', input_tokens=3, prompt_cache_clock='{"generation":1}')
+        assert attempts == [('usage.main', True), ('usage.main', False)]
+        assert 'prompt_cache_clock' not in journaled_at_retry[0]  # journal rewritten before send
+        assert store.flush_token_counts() is True
+        assert store.failure is None
+        # The turn that used to die right here now lands, and the outbox is clean and advanced.
+        assert store.append_messages_batch('s', [{'role': 'assistant', 'content': 'saved'}]) == 1
+        assert store.journal['pending'] == [] and store.journal['next_sequence'] == 3
+    finally:
+        store._outbox_owner.close()
+
+
+def test_a_refused_transcript_receipt_stays_sticky_and_journaled(tmp_path):
+    """Message content is never degraded: a transcript refusal still stops the write path."""
+    def refusing_owner(method, **params):
+        if params['operation'] == 'transcript.append':
+            raise WorkerPersistenceError('invalid_params')
+        return {'value': None}
+
+    store = RuntimeSessionStore(refusing_owner, {'session_id': 's'}, tmp_path / 'private')
+    try:
+        with pytest.raises(WorkerPersistenceError, match='invalid_params'):
+            store.append_messages_batch('s', [{'role': 'user', 'content': 'x'}])
+        assert [e['operation'] for e in json.loads(store.path.read_text())['pending']] == ['transcript.append']
+        with pytest.raises(WorkerPersistenceError, match='invalid_params'):
+            store.queue_token_counts('s', input_tokens=1)
+    finally:
+        store._outbox_owner.close()
+
+
+def test_a_usage_receipt_with_nothing_to_degrade_stays_fatal(tmp_path):
+    """Only a droppable optional field earns a second send; a bare usage refusal is a real
+    contract/integrity signal and must not be swallowed."""
+    def refusing_owner(method, **params):
+        raise WorkerPersistenceError('invalid_params')
+
+    store = RuntimeSessionStore(refusing_owner, {'session_id': 's'}, tmp_path / 'private')
+    try:
+        with pytest.raises(WorkerPersistenceError, match='invalid_params'):
+            store.queue_token_counts('s', input_tokens=1)
+        assert store.failure == 'invalid_params'
+        assert [e['operation'] for e in json.loads(store.path.read_text())['pending']] == ['usage.main']
+    finally:
+        store._outbox_owner.close()

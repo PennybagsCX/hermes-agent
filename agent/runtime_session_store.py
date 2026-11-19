@@ -47,6 +47,19 @@ class WorkerPersistenceError(RuntimeError):
     pass
 
 
+# A usage receipt is an advisory metric, never conversation state. When the owning process is an
+# older build than this worker's checkout (an update staged on disk while the gateway still runs
+# its previous release), the owner's closed usage allowlist rejects the field the newer worker
+# added and answers ``invalid_params``. Left fatal, that one metric poisons ``self.failure`` and
+# every later write -- the assistant turn, the turn lease release -- dies with it, so the whole
+# conversation is lost over a token counter. The receipt is therefore degraded by dropping the
+# fields an older owner cannot know (newest first; each is attribution detail, never a count) and
+# re-submitted. Transcript-bearing operations keep the sticky-fatal contract: message content is
+# never degraded, and a refusal there must still stop rather than lose the turn.
+METRIC_OPERATIONS = frozenset({'usage.main', 'usage.auxiliary'})
+DEGRADABLE_METRIC_FIELDS = ('prompt_cache_clock',)
+
+
 def _caller_summary(limit=8):
     """module:function:line of the frames above this store (its own frames skipped), never
     locals or argument values: best-effort callers swallow the guard's raise (#139029)."""
@@ -330,13 +343,50 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
             self.journal = candidate
             return self.retry_pending()[0]
 
+    def _submit(self, entry):
+        """Send one journaled receipt, degrading a metric the owner's build cannot parse.
+
+        The degraded payload is published to the journal *before* it is sent: the journal is the
+        durable source of truth, so a crash between the owner's commit and our ack must not leave
+        a replay that carries a payload the owner already refused (a different digest at the same
+        sequence is ``admission_conflict``, which no retry can clear).
+        """
+        try:
+            return self.rpc('worker.persist', **self.scope, **entry)
+        except Exception as exc:
+            replacement = self._degraded_metric(entry, exc)
+            if replacement is None:
+                raise
+            candidate = json.loads(json.dumps(self.journal))
+            candidate = dict(candidate, pending=[replacement, *candidate['pending'][1:]])
+            self._save(candidate)
+            self.journal = candidate
+            return self.rpc('worker.persist', **self.scope, **replacement)
+
+    def _degraded_metric(self, entry, exc):
+        """The reduced metric receipt an older owner will accept, or None when nothing may be cut.
+
+        Only a contract refusal (``invalid_params``) of a usage receipt with a droppable field
+        qualifies. Every other refusal -- a sequence the owner has already moved past, a stale
+        generation, a transport failure -- is a real integrity signal and stays fatal.
+        """
+        if str(exc) != 'invalid_params' or entry['operation'] not in METRIC_OPERATIONS:
+            return None
+        dropped = [name for name in DEGRADABLE_METRIC_FIELDS if name in entry['payload']]
+        if not dropped:
+            return None
+        logger.warning('metric_receipt_degraded: %s sequence %s sent to an owner that cannot parse '
+                       '%s (older build than this worker); sending it without %s',
+                       entry['operation'], entry['sequence'], ', '.join(dropped), ', '.join(dropped))
+        return dict(entry, payload={k: v for k, v in entry['payload'].items() if k not in dropped})
+
     def retry_pending(self):
         with self.lock:
             results = []
             try:
                 while self.journal['pending']:
                     entry = self.journal['pending'][0]
-                    result = self.rpc('worker.persist', **self.scope, **entry)
+                    result = self._submit(entry)
                     candidate = dict(self.journal, pending=self.journal['pending'][1:])
                     candidate = self._compression_receipt_journal(candidate, result)
                     self._save(candidate)
